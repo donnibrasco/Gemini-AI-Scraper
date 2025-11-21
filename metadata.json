@@ -1,0 +1,7 @@
+{
+  "name": "Gemini Lead Scraper",
+  "description": "Advanced AI-powered lead generation tool using Google Maps Grounding to find, qualify, and export business leads.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
