@@ -12,6 +12,7 @@ const PROXY_URL = window.location.hostname === 'localhost'
 
 const App: React.FC = () => {
   const [params, setParams] = useState<SearchParams>({ query: '', city: '', country: '' });
+  const [resultCount, setResultCount] = useState<number>(20);
   const [status, setStatus] = useState<ScrapingStatus>(ScrapingStatus.IDLE);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
@@ -36,12 +37,13 @@ const App: React.FC = () => {
 
     try {
       // Step 1: Grounding
-      const { rawText, searchContext } = await searchPlaces(params);
-      addLog("Map search complete. Found raw data.");
+      addLog(`Searching for ${resultCount} leads... (this may take 1-2 minutes)`);
+      const { rawText, searchContext } = await searchPlaces(params, resultCount);
+      addLog("Search complete. Found raw data.");
       
       // Step 2: Extraction
       setStatus(ScrapingStatus.EXTRACTING_DATA);
-      addLog("Analyzing data and extracting leads...");
+      addLog("Extracting and filtering leads... (30-60 seconds)");
       const extractedLeads = await parseAndEnrichLeads(rawText, searchContext);
       
       setLeads(extractedLeads);
@@ -238,6 +240,20 @@ const App: React.FC = () => {
                   onChange={(e) => setParams({...params, country: e.target.value})}
                 />
               </div>
+            </div>
+
+            <div className="md:col-span-2 space-y-2">
+              <label className="text-xs font-bold uppercase tracking-wider text-emerald-400">Results</label>
+              <input
+                type="number"
+                required
+                min="5"
+                max="100"
+                placeholder="20"
+                className="w-full rounded-xl border border-slate-600 bg-slate-950/70 py-3 px-4 text-sm text-white placeholder-slate-500 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/50 focus:bg-slate-950 transition-all shadow-inner"
+                value={resultCount}
+                onChange={(e) => setResultCount(Math.min(100, Math.max(5, parseInt(e.target.value) || 20)))}
+              />
             </div>
 
             <div className="md:col-span-2 flex items-end">

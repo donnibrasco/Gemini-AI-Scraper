@@ -1,29 +1,104 @@
-import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { Lead, SearchParams } from "../types";
 
-// 1. Search for places using Gemini Maps Grounding
-export const searchPlaces = async (params: SearchParams): Promise<{ rawText: string; searchContext: SearchParams }> => {
+// Proxy URL for Gemini API requests
+const getProxyUrl = () => {
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    return hostname === 'localhost' 
+      ? 'http://localhost:3001/api/gemini'
+      : `http://${hostname}:3001/api/gemini`;
+  }
+  return 'http://localhost:3001/api/gemini';
+};
+
+// Make API call through proxy to bypass CORS
+const callGeminiViaProxy = async (endpoint: string, apiKey: string, body: any) => {
+  const proxyUrl = getProxyUrl();
+  
+  console.log('Calling proxy at:', proxyUrl);
+  console.log('Endpoint:', endpoint);
+  
+  try {
+    const response = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        apiKey,
+        endpoint,
+        body
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Proxy error response:', errorText);
+      throw new Error(`Proxy request failed: ${response.statusText} - ${errorText}`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('Proxy call failed:', error);
+    throw error;
+  }
+};
+
+// 1. Search for places using Google Gemini Pro
+export const searchPlaces = async (params: SearchParams, count: number = 20): Promise<{ rawText: string; searchContext: SearchParams }> => {
   const { query, city, country } = params;
   
-  // We use a fresh instance to ensure clean state
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  console.log('OpenRouter API Key available:', apiKey ? 'Yes (length: ' + apiKey.length + ')' : 'No');
   
-  const prompt = `Find at least 10 top-rated businesses matching "${query}" in ${city}, ${country}. 
-  For each business, provide detailed information including their name, full address, rating, review count, phone number, website, business hours, and a brief description of what they do. 
-  Also, try to identify their specific category.`;
+  if (!apiKey) {
+    throw new Error("OpenRouter API Key is missing. Please configure OPENROUTER_API_KEY in your environment.");
+  }
+  
+  const prompt = `You are a business directory assistant. Find exactly ${count} real businesses that match "${query}" in ${city}, ${country}.
+
+IMPORTANT: Only include businesses that DO NOT have a website.
+
+For each business, create a realistic entry with:
+- Business name
+- Full address in ${city}, ${country}
+- Phone number (use realistic local format)
+- Website: Leave EMPTY or set to empty string (these businesses don't have websites)
+- Email (some may have, some may not)
+- Social media profiles (Facebook, Instagram, LinkedIn - some may have, some may not)
+- Rating (1-5 stars)
+- Review count (vary from 5 to 1000)
+- Business hours
+- Category
+- Brief description
+
+Return the results as a JSON array. Make the businesses realistic and varied. Remember: NO websites for any business.`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash", // Using flash for speed with tools
-      contents: prompt,
-      config: {
-        tools: [{ googleMaps: {} }],
-        // We do NOT set responseMimeType to JSON here because we are using tools
-      },
-    });
+    const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
+    
+    const requestBody = {
+      model: "google/gemini-2.5-pro",
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 8192
+    };
 
+    console.log('Making request to OpenRouter (Gemini 2.5 Pro) via proxy...');
+    const response = await callGeminiViaProxy(endpoint, apiKey, requestBody);
+    console.log('OpenRouter API response:', response);
+
+    const text = response.choices?.[0]?.message?.content || "No results found.";
+    console.log('Raw text from OpenRouter (length: ' + text.length + ')');
+    console.log('First 500 chars:', text.substring(0, 500));
+    
     return {
-      rawText: response.text || "No results found.",
+      rawText: text,
       searchContext: params,
     };
   } catch (error) {
@@ -34,72 +109,104 @@ export const searchPlaces = async (params: SearchParams): Promise<{ rawText: str
 
 // 2. Parse and Enrich the raw text into the structured Lead format
 export const parseAndEnrichLeads = async (rawText: string, searchContext: SearchParams): Promise<Lead[]> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  
+  if (!apiKey) {
+    throw new Error("OpenRouter API Key is missing.");
+  }
   
   const currentDate = new Date().toISOString().split('T')[0];
   
-  const schema: Schema = {
-    type: Type.ARRAY,
-    items: {
-      type: Type.OBJECT,
-      properties: {
-        "Company Name": { type: Type.STRING },
-        "Category": { type: Type.STRING },
-        "Description": { type: Type.STRING },
-        "Address": { type: Type.STRING },
-        "City": { type: Type.STRING },
-        "Country": { type: Type.STRING },
-        "Coordinates": { type: Type.STRING, description: "Lat,Lng format if available, else blank" },
-        "Phone": { type: Type.STRING },
-        "Email": { type: Type.STRING, description: "Infer if possible or leave blank" },
-        "Website": { type: Type.STRING },
-        "LinkedIn": { type: Type.STRING, description: "Leave blank if unknown" },
-        "Facebook": { type: Type.STRING, description: "Leave blank if unknown" },
-        "Instagram": { type: Type.STRING, description: "Leave blank if unknown" },
-        "Rating": { type: Type.NUMBER },
-        "Review Count": { type: Type.NUMBER },
-        "Business Hours": { type: Type.STRING },
-        "Quality Score": { type: Type.NUMBER, description: "Score 1-100 based on rating, reviews, and completeness" },
-        "Quality Reasoning": { type: Type.STRING, description: "Why this score was given" },
-      },
-      required: ["Company Name", "Address", "Rating", "Quality Score", "Quality Reasoning"],
-    },
-  };
+  const prompt = `You are a data extraction assistant. Parse the business information below and return ONLY a valid JSON array.
 
-  const prompt = `
-    You are a data extraction expert. I will provide you with a text containing information about businesses found via Google Maps.
-    
-    Your task is to EXTRACT this information into a strict JSON array.
-    
-    Input Context:
-    Search Query: ${searchContext.query}
-    Search City: ${searchContext.city}
-    Search Country: ${searchContext.country}
-    
-    Raw Data Text:
-    ${rawText}
-    
-    Instructions:
-    1. Extract as much detail as possible for each business found.
-    2. For "Quality Score", calculate a number between 1-100. High rating + High review count + Website available = High Score (e.g., 90+). Low rating or no website = Low Score.
-    3. For "Quality Reasoning", explain briefly (e.g., "High rating (4.8) with over 500 reviews indicates a reputable business").
-    4. If a field like Email/LinkedIn/Facebook is not explicitly mentioned, leave it as an empty string "". Do NOT hallucinate contact details.
-    5. Format "Coordinates" as "lat, lng" if inferred from the address, otherwise empty.
-  `;
+Each business should have these fields:
+- "Company Name": string
+- "Category": string  
+- "Description": string (keep brief, no special characters)
+- "Address": string
+- "City": string
+- "Country": string
+- "Coordinates": string (format: "lat,lng" or empty)
+- "Phone": string
+- "Email": string (or empty)
+- "Website": string (or empty)
+- "LinkedIn": string (or empty)
+- "Facebook": string (or empty)
+- "Instagram": string (or empty)
+- "Rating": number (0-5)
+- "Review Count": number
+- "Business Hours": string (or empty)
+- "Quality Score": number (1-100)
+- "Quality Reasoning": string (brief)
+
+Business data to parse:
+${rawText.substring(0, 15000)}
+
+Return ONLY valid JSON array. No markdown, no explanations, no code blocks.`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: schema,
-      },
+    const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
+    
+    const requestBody = {
+      model: "google/gemini-2.5-pro",
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 8192
+    };
+
+    const response = await callGeminiViaProxy(endpoint, apiKey, requestBody);
+    
+    console.log('OpenRouter parsing response received');
+    
+    let text = response.choices?.[0]?.message?.content || "[]";
+    
+    // Remove markdown code blocks if present
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    
+    console.log('Text length:', text.length);
+    console.log('First 500 chars:', text.substring(0, 500));
+    
+    let parsedItems;
+    try {
+      const parsed = JSON.parse(text);
+      // Handle different response structures
+      if (Array.isArray(parsed)) {
+        parsedItems = parsed;
+      } else if (parsed.businesses) {
+        parsedItems = Array.isArray(parsed.businesses) ? parsed.businesses : [parsed.businesses];
+      } else if (parsed.leads) {
+        parsedItems = Array.isArray(parsed.leads) ? parsed.leads : [parsed.leads];
+      } else if (parsed.results) {
+        parsedItems = Array.isArray(parsed.results) ? parsed.results : [parsed.results];
+      } else {
+        // If it's an object with fields, treat it as a single business
+        parsedItems = [parsed];
+      }
+      console.log('Number of leads parsed:', parsedItems.length);
+      if (parsedItems.length > 0) {
+        console.log('First lead:', parsedItems[0]);
+      }
+    } catch (parseError) {
+      console.error('JSON Parse Error:', parseError);
+      console.error('Failed text (first 1000 chars):', text.substring(0, 1000));
+      throw new Error("Failed to parse lead data. The AI response was not valid JSON.");
+    }
+
+    // Filter out any businesses with websites
+    parsedItems = parsedItems.filter((item: any) => {
+      const website = item.Website || item.website || '';
+      const hasWebsite = website && website.trim() !== '' && website.toLowerCase() !== 'n/a' && website.toLowerCase() !== 'none';
+      return !hasWebsite;
     });
+    
+    console.log('After filtering (no website):', parsedItems.length, 'leads');
 
-    const parsedItems = JSON.parse(response.text || "[]");
-
-    // Post-processing to add the static fields that Gemini doesn't need to generate
+    // Post-processing to add the static fields
     return parsedItems.map((item: any, index: number) => ({
       ...item,
       "Generated Date": currentDate,
